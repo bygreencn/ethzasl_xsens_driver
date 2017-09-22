@@ -15,7 +15,7 @@ import time
 import datetime
 
 # transform Euler angles or matrix into quaternions
-from math import radians, sqrt
+from math import radians, sqrt, atan2
 from tf.transformations import quaternion_from_matrix, quaternion_from_euler,\
     identity_matrix
 
@@ -58,6 +58,15 @@ class XSensDriver(object):
         rospy.loginfo("MT node interface: %s at %d bd." % (device, baudrate))
         self.mt = mtdevice.MTDevice(device, baudrate, timeout)
 
+        # optional no rotation procedure for internal calibration of biases
+        # (only mark iv devices)
+        no_rotation_duration = get_param('~no_rotation_duration', 0)
+        if no_rotation_duration:
+            rospy.loginfo("Starting the no-rotation procedure to estimate the "
+                          "gyroscope biases for %d s. Please don't move the IMU"
+                          " during this time." % no_rotation_duration)
+            self.mt.SetNoRotation(no_rotation_duration)
+
         self.frame_id = get_param('~frame_id', '/base_imu')
 
         self.frame_local = get_param('~frame_local', 'ENU')
@@ -88,6 +97,8 @@ class XSensDriver(object):
 
         # publish a string version of all data; to be parsed by clients
         self.str_pub = rospy.Publisher('imu_data_str', String, queue_size=10)
+        self.last_delta_q_time = None
+        self.delta_q_rate = None
 
     def reset_vars(self):
         self.imu_msg = Imu()
@@ -501,10 +512,10 @@ class XSensDriver(object):
                 # flags
                 fixtype = o['fixtype']
                 if fixtype == 0x00:
-                    self.gps_msg.status = NavSatStatus.STATUS_NO_FIX  # no fix
+                    self.gps_msg.status.status = NavSatStatus.STATUS_NO_FIX  # no fix
                     self.gps_msg.status.service = 0
                 else:
-                    self.gps_msg.status = NavSatStatus.STATUS_FIX  # unaugmented
+                    self.gps_msg.status.status = NavSatStatus.STATUS_FIX  # unaugmented
                     self.gps_msg.status.service = NavSatStatus.SERVICE_GPS
                 # lat lon alt
                 self.gps_msg.latitude = o['lat']
@@ -522,6 +533,50 @@ class XSensDriver(object):
             '''Fill messages with information from 'Angular Velocity' MTData2
             block.'''
             try:
+                dqw, dqx, dqy, dqz = convert_quat(
+                    (o['Delta q0'], o['Delta q1'], o['Delta q2'],
+                     o['Delta q3']),
+                    o['frame'])
+                now = rospy.Time.now()
+                if self.last_delta_q_time is None:
+                    self.last_delta_q_time = now
+                else:
+                    # update rate (filtering needed to account for lag variance)
+                    delta_t = (now - self.last_delta_q_time).to_sec()
+                    if self.delta_q_rate is None:
+                        self.delta_q_rate = 1./delta_t
+                    delta_t_filtered = .95/self.delta_q_rate + .05*delta_t
+                    # rate in necessarily integer
+                    self.delta_q_rate = round(1./delta_t_filtered)
+                    self.last_delta_q_time = now
+                    # relationship between \Delta q and velocity \bm{\omega}:
+                    # \bm{w} = \Delta t . \bm{\omega}
+                    # \theta = |\bm{w}|
+                    # \Delta q = [cos{\theta/2}, sin{\theta/2)/\theta . \bm{\omega}
+                    # extract rotation angle over delta_t
+                    ca_2, sa_2 = dqw, sqrt(dqx**2 + dqy**2 + dqz**2)
+                    ca = ca_2**2 - sa_2**2
+                    sa = 2*ca_2*sa_2
+                    rotation_angle = atan2(sa, ca)
+                    # compute rotation velocity
+                    rotation_speed = rotation_angle * self.delta_q_rate
+                    f = rotation_speed / sa_2
+                    x, y, z = f*dqx, f*dqy, f*dqz
+                    self.imu_msg.angular_velocity.x = x
+                    self.imu_msg.angular_velocity.y = y
+                    self.imu_msg.angular_velocity.z = z
+                    self.imu_msg.angular_velocity_covariance = (
+                        radians(0.025), 0., 0.,
+                        0., radians(0.025), 0.,
+                        0., 0., radians(0.025))
+                    self.pub_imu = True
+                    self.vel_msg.twist.angular.x = x
+                    self.vel_msg.twist.angular.y = y
+                    self.vel_msg.twist.angular.z = z
+                    self.pub_vel = True
+            except KeyError:
+                pass
+            try:
                 x, y, z = convert_coords(o['gyrX'], o['gyrY'], o['gyrZ'],
                                          o['frame'])
                 self.imu_msg.angular_velocity.x = x
@@ -538,7 +593,6 @@ class XSensDriver(object):
                 self.pub_vel = True
             except KeyError:
                 pass
-            # TODO decide what to do with 'Delta q'
 
         def fill_from_GPS(o):
             '''Fill messages with information from 'GPS' MTData2 block.'''
@@ -681,12 +735,12 @@ class XSensDriver(object):
                                                  queue_size=10)
             self.press_pub.publish(self.press_msg)
         if self.pub_anin1:
-            if self.pub_analog_in1_pub is None:
+            if self.analog_in1_pub is None:
                 self.analog_in1_pub = rospy.Publisher('analog_in1',
                                                       UInt16, queue_size=10)
             self.analog_in1_pub.publish(self.anin1_msg)
         if self.pub_anin2:
-            if self.pub_analog_in2_pub is None:
+            if self.analog_in2_pub is None:
                 self.analog_in2_pub = rospy.Publisher('analog_in2', UInt16,
                                                       queue_size=10)
             self.analog_in2_pub.publish(self.anin2_msg)
